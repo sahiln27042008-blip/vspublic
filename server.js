@@ -41,7 +41,7 @@ function authorized(req) {
 }
 
 function bridgeReady() {
-  return (
+  return !!(
     bridge &&
     bridge.readyState === WebSocket.OPEN
   );
