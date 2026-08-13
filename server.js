@@ -19,15 +19,19 @@ function id() {
   return crypto.randomUUID();
 }
 
-function sendJson(res, status, body) {
+function sendJson(res, status, body, extraHeaders = {}) {
   const data = JSON.stringify(body);
 
   res.writeHead(status, {
     "Content-Type": "application/json",
+    "Cache-Control": "no-cache",
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Headers":
-      "Content-Type, Authorization",
-    "Content-Length": Buffer.byteLength(data)
+      "Content-Type, Authorization, Accept, MCP-Protocol-Version, Mcp-Session-Id, Mcp-Method, Mcp-Name",
+    "Access-Control-Expose-Headers":
+      "Mcp-Session-Id, MCP-Protocol-Version",
+    "Content-Length": Buffer.byteLength(data),
+    ...extraHeaders
   });
 
   res.end(data);
@@ -47,10 +51,43 @@ function bridgeReady() {
   );
 }
 
-const server = http.createServer((req, res) => {
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+
+    req.on("data", chunk => {
+      body += chunk;
+
+      if (body.length > 10 * 1024 * 1024) {
+        reject(new Error("Request body too large"));
+        req.destroy();
+      }
+    });
+
+    req.on("end", () => resolve(body));
+    req.on("error", reject);
+  });
+}
+
+const server = http.createServer(async (req, res) => {
 
   /*
-   * Health check
+   * CORS
+   */
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Headers":
+        "Content-Type, Authorization, Accept, MCP-Protocol-Version, Mcp-Session-Id, Mcp-Method, Mcp-Name",
+      "Access-Control-Allow-Methods":
+        "GET, POST, OPTIONS"
+    });
+
+    return res.end();
+  }
+
+  /*
+   * Health
    */
   if (
     req.method === "GET" &&
@@ -64,7 +101,130 @@ const server = http.createServer((req, res) => {
   }
 
   /*
-   * Public → local message endpoint.
+   * PUBLIC MCP ENDPOINT
+   *
+   * Remote MCP client
+   *        ↓
+   * POST /mcp
+   *        ↓
+   * WebSocket /bridge
+   *        ↓
+   * VS Code client
+   *        ↓
+   * localhost:8091
+   */
+  if (
+    req.method === "POST" &&
+    req.url === "/mcp"
+  ) {
+
+    if (!authorized(req)) {
+      return sendJson(res, 401, {
+        jsonrpc: "2.0",
+        error: {
+          code: -32001,
+          message: "Unauthorized"
+        },
+        id: null
+      });
+    }
+
+    if (!bridgeReady()) {
+      return sendJson(res, 503, {
+        jsonrpc: "2.0",
+        error: {
+          code: -32000,
+          message: "Local VS Code bridge is offline"
+        },
+        id: null
+      });
+    }
+
+    let body;
+
+    try {
+      body = await readBody(req);
+    } catch (err) {
+      return sendJson(res, 413, {
+        jsonrpc: "2.0",
+        error: {
+          code: -32600,
+          message: err.message
+        },
+        id: null
+      });
+    }
+
+    let payload;
+
+    try {
+      payload = JSON.parse(body);
+    } catch {
+      return sendJson(res, 400, {
+        jsonrpc: "2.0",
+        error: {
+          code: -32700,
+          message: "Invalid JSON"
+        },
+        id: null
+      });
+    }
+
+    const requestId = id();
+
+    /*
+     * Preserve MCP transport headers.
+     */
+    const headers = {
+      "mcp-protocol-version":
+        req.headers["mcp-protocol-version"] || "",
+
+      "mcp-session-id":
+        req.headers["mcp-session-id"] || "",
+
+      "mcp-method":
+        req.headers["mcp-method"] || "",
+
+      "mcp-name":
+        req.headers["mcp-name"] || ""
+    };
+
+    const timer = setTimeout(() => {
+      const job = pending.get(requestId);
+
+      if (!job) return;
+
+      pending.delete(requestId);
+
+      if (!job.res.headersSent) {
+        sendJson(job.res, 504, {
+          jsonrpc: "2.0",
+          error: {
+            code: -32000,
+            message: "Local bridge timeout"
+          },
+          id: payload.id ?? null
+        });
+      }
+    }, 120000);
+
+    pending.set(requestId, {
+      res,
+      timer
+    });
+
+    bridge.send(JSON.stringify({
+      type: "request",
+      id: requestId,
+      payload,
+      headers
+    }));
+
+    return;
+  }
+
+  /*
+   * Existing generic push endpoint.
    */
   if (
     req.method === "POST" &&
@@ -85,58 +245,77 @@ const server = http.createServer((req, res) => {
       });
     }
 
-    let body = "";
+    let body;
 
-    req.on("data", chunk => {
-      body += chunk;
+    try {
+      body = await readBody(req);
+    } catch (err) {
+      return sendJson(res, 413, {
+        ok: false,
+        error: err.message
+      });
+    }
 
-      if (body.length > 10 * 1024 * 1024) {
-        req.destroy();
-      }
-    });
+    let payload;
 
-    req.on("end", () => {
+    try {
+      payload = JSON.parse(body);
+    } catch {
+      return sendJson(res, 400, {
+        ok: false,
+        error: "Invalid JSON"
+      });
+    }
 
-      let payload;
+    const requestId = id();
 
-      try {
-        payload = JSON.parse(body);
-      } catch {
-        return sendJson(res, 400, {
+    const timer = setTimeout(() => {
+      const job = pending.get(requestId);
+
+      if (!job) return;
+
+      pending.delete(requestId);
+
+      if (!job.res.headersSent) {
+        sendJson(res, 504, {
           ok: false,
-          error: "Invalid JSON"
+          error: "Local bridge timeout",
+          id: requestId
         });
       }
+    }, 120000);
 
-      const requestId = id();
-
-      const timer = setTimeout(() => {
-
-        pending.delete(requestId);
-
-        if (!res.headersSent) {
-          sendJson(res, 504, {
-            ok: false,
-            error: "Local bridge timeout",
-            id: requestId
-          });
-        }
-
-      }, 120000);
-
-      pending.set(requestId, {
-        res,
-        timer
-      });
-
-      bridge.send(JSON.stringify({
-        type: "request",
-        id: requestId,
-        payload
-      }));
+    pending.set(requestId, {
+      res,
+      timer
     });
 
+    bridge.send(JSON.stringify({
+      type: "request",
+      id: requestId,
+      payload,
+      headers: {}
+    }));
+
     return;
+  }
+
+  /*
+   * MCP endpoint does not need GET for your setup.
+   */
+  if (
+    req.method === "GET" &&
+    req.url === "/mcp"
+  ) {
+    res.writeHead(405, {
+      "Allow": "POST",
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*"
+    });
+
+    return res.end(JSON.stringify({
+      error: "Use POST /mcp"
+    }));
   }
 
   sendJson(res, 404, {
@@ -147,7 +326,7 @@ const server = http.createServer((req, res) => {
 
 
 /*
- * Local bridge connects OUTBOUND to this WebSocket.
+ * WebSocket bridge
  */
 const wss = new WebSocket.Server({
   server,
@@ -180,7 +359,6 @@ wss.on("connection", (socket, request) => {
   bridge = socket;
 
   console.log("[RELAY] local bridge connected");
-
 
   socket.on("message", raw => {
 
@@ -218,10 +396,33 @@ wss.on("connection", (socket, request) => {
       return;
     }
 
+    const responseHeaders = {};
+
+    /*
+     * Return MCP session/protocol headers
+     * to the remote MCP client.
+     */
+    if (
+      message.headers &&
+      message.headers["mcp-session-id"]
+    ) {
+      responseHeaders["Mcp-Session-Id"] =
+        message.headers["mcp-session-id"];
+    }
+
+    if (
+      message.headers &&
+      message.headers["mcp-protocol-version"]
+    ) {
+      responseHeaders["MCP-Protocol-Version"] =
+        message.headers["mcp-protocol-version"];
+    }
+
     sendJson(
       job.res,
       message.status || 200,
-      message.payload
+      message.payload,
+      responseHeaders
     );
   });
 
