@@ -1,14 +1,15 @@
 "use strict";
-
 const http = require("http");
 const crypto = require("crypto");
 const WebSocket = require("ws");
 
 const PORT = Number(process.env.PORT || 10000);
-const TOKEN = process.env.RELAY_TOKEN;
+const PUBLIC_ROUTE = process.env.PUBLIC_ROUTE || "/hutgugbrtuy574586776";
+const BRIDGE_TOKEN = process.env.RELAY_TOKEN;
+const LOCAL_MCP_URL = process.env.LOCAL_MCP_URL || "http://127.0.0.1:8091/mcp";
 
-if (!TOKEN) {
-  console.error("Missing RELAY_TOKEN environment variable.");
+if (!BRIDGE_TOKEN) {
+  console.error("Missing RELAY_TOKEN");
   process.exit(1);
 }
 
@@ -33,34 +34,25 @@ function sendJson(res, status, body, extraHeaders = {}) {
   res.end(data);
 }
 
-function authorized(req) {
-  return req.headers.authorization === `Bearer ${TOKEN}`;
-}
-
-function bridgeReady() {
-  return !!(bridge && bridge.readyState === WebSocket.OPEN);
-}
-
-// FIX: Bulletproof readBody with running byte counter
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    let totalBytes = 0;
-
+    let total = 0;
     req.on("data", chunk => {
       chunks.push(chunk);
-      totalBytes += chunk.length;
-      if (totalBytes > 10 * 1024 * 1024) {
-        reject(new Error("Request body too large"));
+      total += chunk.length;
+      if (total > 10 * 1024 * 1024) {
+        reject(new Error("Body too large"));
         req.destroy();
       }
     });
-
-    req.on("end", () => {
-      resolve(Buffer.concat(chunks).toString("utf8"));
-    });
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
     req.on("error", reject);
   });
+}
+
+function isLocalBridgeReady() {
+  return !!(bridge && bridge.readyState === WebSocket.OPEN);
 }
 
 const server = http.createServer(async (req, res) => {
@@ -68,43 +60,49 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(204, {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept, MCP-Protocol-Version, Mcp-Session-Id, Mcp-Method, Mcp-Name",
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS"
+      "Access-Control-Allow-Methods": "POST, OPTIONS"
     });
-    return res.end();
+    res.end();
+    return;
   }
 
   if (req.method === "GET" && req.url === "/health") {
     return sendJson(res, 200, {
       ok: true,
-      bridgeConnected: bridgeReady(),
-      service: "vscode-mcp-relay"
+      bridgeConnected: isLocalBridgeReady(),
+      service: "mcp-public-relay"
     });
   }
 
-  if (req.method === "POST" && req.url === "/mcp") {
-    if (!authorized(req)) {
-      return sendJson(res, 401, { jsonrpc: "2.0", error: { code: -32001, message: "Unauthorized" }, id: null });
-    }
-    if (!bridgeReady()) {
-      return sendJson(res, 503, { jsonrpc: "2.0", error: { code: -32000, message: "Local VS Code bridge is offline" }, id: null });
+  if (req.method === "POST" && req.url === PUBLIC_ROUTE) {
+    if (!isLocalBridgeReady()) {
+      return sendJson(res, 503, {
+        jsonrpc: "2.0",
+        error: { code: -32000, message: "Local bridge is offline" },
+        id: null
+      });
     }
 
-    let body;
+    let raw;
     try {
-      body = await readBody(req);
+      raw = await readBody(req);
     } catch (err) {
-      return sendJson(res, 413, { jsonrpc: "2.0", error: { code: -32600, message: err.message }, id: null });
-    }
-
-    if (!body || body.trim() === "") {
-      return sendJson(res, 400, { jsonrpc: "2.0", error: { code: -32700, message: "Invalid JSON: Empty body received" }, id: null });
+      return sendJson(res, 413, {
+        jsonrpc: "2.0",
+        error: { code: -32600, message: err.message },
+        id: null
+      });
     }
 
     let payload;
     try {
-      payload = JSON.parse(body);
+      payload = JSON.parse(raw);
     } catch (e) {
-      return sendJson(res, 400, { jsonrpc: "2.0", error: { code: -32700, message: "Invalid JSON: " + e.message }, id: null });
+      return sendJson(res, 400, {
+        jsonrpc: "2.0",
+        error: { code: -32700, message: "Invalid JSON: " + e.message },
+        id: null
+      });
     }
 
     const requestId = id();
@@ -115,48 +113,28 @@ const server = http.createServer(async (req, res) => {
       "mcp-name": req.headers["mcp-name"] || ""
     };
 
-    console.log(`[RELAY] HTTP request. Method: ${payload.method || "unknown"}. Body length: ${body.length}`);
-
     const timer = setTimeout(() => {
       const job = pending.get(requestId);
       if (!job) return;
       pending.delete(requestId);
       if (!job.res.headersSent) {
-        sendJson(job.res, 504, { jsonrpc: "2.0", error: { code: -32000, message: "Local bridge timeout" }, id: payload.id ?? null });
+        sendJson(job.res, 504, {
+          jsonrpc: "2.0",
+          error: { code: -32000, message: "Local bridge timeout" },
+          id: payload.id ?? null
+        });
       }
     }, 120000);
 
     pending.set(requestId, { res, timer });
-    bridge.send(JSON.stringify({ type: "request", id: requestId, payload, headers }));
+    bridge.send(JSON.stringify({
+      type: "request",
+      id: requestId,
+      payload,
+      headers
+    }));
+
     return;
-  }
-
-  if (req.method === "POST" && req.url === "/push") {
-    if (!authorized(req)) return sendJson(res, 401, { ok: false, error: "Unauthorized" });
-    if (!bridgeReady()) return sendJson(res, 503, { ok: false, error: "Local VS Code bridge is offline" });
-
-    let body;
-    try { body = await readBody(req); } catch (err) { return sendJson(res, 413, { ok: false, error: err.message }); }
-
-    let payload;
-    try { payload = JSON.parse(body); } catch { return sendJson(res, 400, { ok: false, error: "Invalid JSON" }); }
-
-    const requestId = id();
-    const timer = setTimeout(() => {
-      const job = pending.get(requestId);
-      if (!job) return;
-      pending.delete(requestId);
-      if (!job.res.headersSent) sendJson(res, 504, { ok: false, error: "Local bridge timeout", id: requestId });
-    }, 120000);
-
-    pending.set(requestId, { res, timer });
-    bridge.send(JSON.stringify({ type: "request", id: requestId, payload, headers: {} }));
-    return;
-  }
-
-  if (req.method === "GET" && req.url === "/mcp") {
-    res.writeHead(405, { "Allow": "POST", "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-    return res.end(JSON.stringify({ error: "Use POST /mcp" }));
   }
 
   sendJson(res, 404, { ok: false, error: "Not found" });
@@ -164,71 +142,65 @@ const server = http.createServer(async (req, res) => {
 
 const wss = new WebSocket.Server({ server, path: "/bridge" });
 
-wss.on("connection", (socket, request) => {
-  const url = new URL(request.url, `http://${request.headers.host}`);
-  const suppliedToken = url.searchParams.get("token");
+wss.on("connection", (socket, req) => {
+  const url = new URL(req.url, "http://localhost");
+  const token = url.searchParams.get("token");
 
-  if (suppliedToken !== TOKEN) {
+  if (token !== BRIDGE_TOKEN) {
     socket.close(1008, "Unauthorized");
     return;
   }
 
-  if (bridgeReady()) {
+  if (bridge && bridge.readyState === WebSocket.OPEN) {
     bridge.close(1000, "Replaced by newer bridge");
   }
 
   bridge = socket;
-  console.log("[RELAY] local bridge connected");
+  console.log("[BRIDGE] local client connected");
 
   socket.on("message", raw => {
-    let message;
+    let msg;
     try {
-      message = JSON.parse(raw.toString());
+      msg = JSON.parse(raw.toString());
     } catch {
-      console.error("[RELAY] invalid bridge message");
+      console.error("[BRIDGE] invalid message");
       return;
     }
 
-    if (message.type !== "response") return;
+    if (msg.type !== "response") return;
 
-    const job = pending.get(message.id);
+    const job = pending.get(msg.id);
     if (!job) return;
 
-    pending.delete(message.id);
+    pending.delete(msg.id);
     clearTimeout(job.timer);
-
     if (job.res.headersSent) return;
 
-    const responseHeaders = {};
-
-    // FIX: Map lowercase WebSocket keys back to standard HTTP headers
-    if (message.headers && message.headers["mcp-session-id"]) {
-      responseHeaders["Mcp-Session-Id"] = message.headers["mcp-session-id"];
+    const headers = {};
+    if (msg.headers && msg.headers["mcp-session-id"]) {
+      headers["Mcp-Session-Id"] = msg.headers["mcp-session-id"];
     }
-    if (message.headers && message.headers["mcp-protocol-version"]) {
-      responseHeaders["MCP-Protocol-Version"] = message.headers["mcp-protocol-version"];
+    if (msg.headers && msg.headers["mcp-protocol-version"]) {
+      headers["MCP-Protocol-Version"] = msg.headers["mcp-protocol-version"];
     }
 
-    sendJson(job.res, message.status || 200, message.payload, responseHeaders);
+    sendJson(job.res, msg.status || 200, msg.payload, headers);
   });
-
-  const heartbeat = setInterval(() => {
-    if (socket.readyState === WebSocket.OPEN) socket.ping();
-  }, 30000);
 
   socket.on("close", () => {
-    clearInterval(heartbeat);
     if (bridge === socket) {
       bridge = null;
-      console.log("[RELAY] local bridge disconnected");
+      console.log("[BRIDGE] local client disconnected");
     }
   });
 
-  socket.on("error", error => {
-    console.error("[RELAY] WebSocket error:", error.message);
+  socket.on("error", err => {
+    console.error("[BRIDGE] error:", err.message);
   });
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`[RELAY] listening on ${PORT}`);
+  console.log(`[PUBLIC] listening on ${PORT}`);
+  console.log(`[PUBLIC] use POST http://localhost:${PORT}${PUBLIC_ROUTE}`);
+  console.log(`[PUBLIC] local bridge: ws://localhost:${PORT}/bridge?token=...`);
 });
