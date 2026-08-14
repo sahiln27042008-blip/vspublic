@@ -1,14 +1,15 @@
 "use strict";
+
 const http = require("http");
 const crypto = require("crypto");
 const WebSocket = require("ws");
 
 const PORT = Number(process.env.PORT || 10000);
 const PUBLIC_ROUTE = process.env.PUBLIC_ROUTE || "/hutgugbrtuy574586776";
-const BRIDGE_TOKEN = process.env.RELAY_TOKEN;
+const RELAY_TOKEN = process.env.RELAY_TOKEN;
 const LOCAL_MCP_URL = process.env.LOCAL_MCP_URL || "http://127.0.0.1:8091/mcp";
 
-if (!BRIDGE_TOKEN) {
+if (!RELAY_TOKEN) {
   console.error("Missing RELAY_TOKEN");
   process.exit(1);
 }
@@ -18,6 +19,25 @@ const pending = new Map();
 
 function id() {
   return crypto.randomUUID();
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+
+    req.on("data", chunk => {
+      chunks.push(chunk);
+      total += chunk.length;
+      if (total > 10 * 1024 * 1024) {
+        reject(new Error("Request body too large"));
+        req.destroy();
+      }
+    });
+
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", reject);
+  });
 }
 
 function sendJson(res, status, body, extraHeaders = {}) {
@@ -34,24 +54,7 @@ function sendJson(res, status, body, extraHeaders = {}) {
   res.end(data);
 }
 
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let total = 0;
-    req.on("data", chunk => {
-      chunks.push(chunk);
-      total += chunk.length;
-      if (total > 10 * 1024 * 1024) {
-        reject(new Error("Body too large"));
-        req.destroy();
-      }
-    });
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-    req.on("error", reject);
-  });
-}
-
-function isLocalBridgeReady() {
+function bridgeReady() {
   return !!(bridge && bridge.readyState === WebSocket.OPEN);
 }
 
@@ -60,22 +63,21 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(204, {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept, MCP-Protocol-Version, Mcp-Session-Id, Mcp-Method, Mcp-Name",
-      "Access-Control-Allow-Methods": "POST, OPTIONS"
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS"
     });
-    res.end();
-    return;
+    return res.end();
   }
 
   if (req.method === "GET" && req.url === "/health") {
     return sendJson(res, 200, {
       ok: true,
-      bridgeConnected: isLocalBridgeReady(),
+      bridgeConnected: bridgeReady(),
       service: "mcp-public-relay"
     });
   }
 
   if (req.method === "POST" && req.url === PUBLIC_ROUTE) {
-    if (!isLocalBridgeReady()) {
+    if (!bridgeReady()) {
       return sendJson(res, 503, {
         jsonrpc: "2.0",
         error: { code: -32000, message: "Local bridge is offline" },
@@ -127,6 +129,7 @@ const server = http.createServer(async (req, res) => {
     }, 120000);
 
     pending.set(requestId, { res, timer });
+
     bridge.send(JSON.stringify({
       type: "request",
       id: requestId,
@@ -146,7 +149,7 @@ wss.on("connection", (socket, req) => {
   const url = new URL(req.url, "http://localhost");
   const token = url.searchParams.get("token");
 
-  if (token !== BRIDGE_TOKEN) {
+  if (token !== RELAY_TOKEN) {
     socket.close(1008, "Unauthorized");
     return;
   }
@@ -174,6 +177,7 @@ wss.on("connection", (socket, req) => {
 
     pending.delete(msg.id);
     clearTimeout(job.timer);
+
     if (job.res.headersSent) return;
 
     const headers = {};
@@ -201,6 +205,7 @@ wss.on("connection", (socket, req) => {
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`[PUBLIC] listening on ${PORT}`);
-  console.log(`[PUBLIC] use POST http://localhost:${PORT}${PUBLIC_ROUTE}`);
-  console.log(`[PUBLIC] local bridge: ws://localhost:${PORT}/bridge?token=...`);
+  console.log(`[PUBLIC] GET /health`);
+  console.log(`[PUBLIC] POST ${PUBLIC_ROUTE}`);
+  console.log(`[PUBLIC] WS /bridge?token=...`);
 });
