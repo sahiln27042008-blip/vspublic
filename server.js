@@ -17,6 +17,32 @@ if (!RELAY_TOKEN) {
 let bridge = null;
 const pending = new Map();
 
+// Cloud load balancers (Render included) silently kill idle WebSocket
+// connections after ~55-60s without a clean close frame. Without a
+// heartbeat, `bridge.readyState` keeps reporting OPEN on a connection
+// that's actually dead, so requests get sent into a black hole and only
+// fail once the 120s pending-request timer expires — or once some other
+// request happens to notice bridgeReady() is false. Pinging every 25s and
+// terminating anything that misses two pongs makes `bridge` become null
+// immediately when the link actually dies, which turns a mystery 120s
+// hang into an honest, immediate 503.
+const HEARTBEAT_INTERVAL_MS = 25000;
+const heartbeatTimer = setInterval(() => {
+  if (!bridge) return;
+  if (bridge.isAlive === false) {
+    console.log("[BRIDGE] heartbeat missed twice — terminating stale connection");
+    bridge.terminate(); // fires 'close' below, which clears `bridge`
+    return;
+  }
+  bridge.isAlive = false;
+  try {
+    bridge.ping();
+  } catch (_) {
+    // socket already going away; 'close' handler will clean up
+  }
+}, HEARTBEAT_INTERVAL_MS);
+heartbeatTimer.unref();
+
 function id() {
   return crypto.randomUUID();
 }
@@ -159,7 +185,12 @@ wss.on("connection", (socket, req) => {
   }
 
   bridge = socket;
+  bridge.isAlive = true;
   console.log("[BRIDGE] local client connected");
+
+  socket.on("pong", () => {
+    socket.isAlive = true;
+  });
 
   socket.on("message", raw => {
     let msg;
